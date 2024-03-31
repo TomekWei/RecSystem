@@ -120,7 +120,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--dataset_name",
         type=str,
         choices=["criteo_1t", "criteo_kaggle"],
-        default="criteo_1t",
+        default="criteo_kaggle",
         help="dataset for experiment, current support criteo_1tb, criteo_kaggle",
     )
     parser.add_argument(
@@ -331,7 +331,8 @@ def _evaluate(
     """
     pipeline._model.eval()
     device = pipeline._device
-
+    # print(pipeline)
+    print(device)
     iterator = itertools.islice(iter(eval_dataloader), limit_batches)
 
     auroc = metrics.AUROC(compute_on_step=False, task="binary").to(device)
@@ -721,6 +722,7 @@ def main(argv: List[str]) -> None:
 
 def invoke_main() -> None:
     main(sys.argv[1:])
+
 
 
 if __name__ == "__main__":
