@@ -13,7 +13,7 @@ import torchrec
 from torchrec.datasets.utils import Batch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-torchrec.datasets.scripts.npy_preproc_criteo
+# torchrec.datasets.scripts.npy_preproc_criteo
 
 
 class RestartableMap:

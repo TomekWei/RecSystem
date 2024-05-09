@@ -14,6 +14,7 @@ from typing import Iterator, List, Optional
 
 import torch
 import torchmetrics as metrics
+import numpy as np
 from pyre_extensions import none_throws
 from torch import distributed as dist
 from torch.utils.data import DataLoader
@@ -35,6 +36,11 @@ from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backwa
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from tqdm import tqdm
+
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # OSS import
 try:
@@ -334,9 +340,9 @@ def _evaluate(
     # print(pipeline)
     print(device)
     iterator = itertools.islice(iter(eval_dataloader), limit_batches)
-
-    auroc = metrics.AUROC(compute_on_step=False, task="binary").to(device)
-
+    
+    # auroc = metrics.AUROC(compute_on_step=False, task="binary").to(device)
+    auroc = metrics.AUROC(task="binary").to(device)
     is_rank_zero = dist.get_rank() == 0
     if is_rank_zero:
         pbar = tqdm(
@@ -348,7 +354,9 @@ def _evaluate(
     with torch.no_grad():
         while True:
             try:
-                _loss, logits, labels = pipeline.progress(iterator)
+                # _loss, logits, labels =P pipeline.progress(iterator)
+                loss, out = pipeline.progress(iterator)
+                _loss, logits, labels = out
                 preds = torch.sigmoid(logits)
                 auroc(preds, labels)
                 if is_rank_zero:
@@ -382,6 +390,8 @@ def _train(
     validation_freq: Optional[int],
     limit_train_batches: Optional[int],
     limit_val_batches: Optional[int],
+    writer: Optional[SummaryWriter] = None,
+    profiler: Optional[torch.profiler.profile] = None
 ) -> None:
     """
     Trains model for 1 epoch. Helper function for train_val_test.
@@ -400,6 +410,14 @@ def _train(
     Returns:
         None.
     """
+    # if profiler is not None:
+    #     currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
+    #     trace_handler = torch.profiler.tensorboard_trace_handler('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/profiler/test'+currenttime)
+    #     profiler.add_step_handler(trace_handler)
+        
+    specific_it = 437
+    # if profiler is not None:
+    #         print("profiling")
     pipeline._model.train()
 
     iterator = itertools.islice(iter(train_dataloader), limit_train_batches)
@@ -419,25 +437,48 @@ def _train(
         if validation_freq
         else limit_train_batches if limit_train_batches else len(train_dataloader)
     )
+    skip = False
     for batched_iterator in batched(iterator, n):
+        
+        if skip:
+            skip = False
+
+            continue
         for it in itertools.count(start_it):
             try:
                 if is_rank_zero and print_lr:
                     for i, g in enumerate(pipeline._optimizer.param_groups):
                         print(f"lr: {it} {i} {g['lr']:.6f}")
-                pipeline.progress(batched_iterator)
+                        if(writer is not None):
+                            writer.add_scalar(f'Learning Rate/Group {i}', g['lr'], it)
+
+                loss, _ = pipeline.progress(batched_iterator)
+                if(loss is None or np.isnan(loss)):
+                    skip = True
+                    break
+                
+                if(writer is not None):
+                    writer.add_scalar('Training Loss', loss, it)
+
                 lr_scheduler.step()
+
+                if profiler is not None:
+                    profiler.step()
+                
                 if is_rank_zero:
                     pbar.update(1)
+            
             except StopIteration:
                 if is_rank_zero:
                     print("Total number of iterations:", it)
                 start_it = it
                 break
-
+        
+        
         if validation_freq and start_it % validation_freq == 0:
             _evaluate(limit_val_batches, pipeline, val_dataloader, "val")
             pipeline._model.train()
+        
 
 
 @dataclass
@@ -455,6 +496,7 @@ def train_val_test(
     val_dataloader: DataLoader,
     test_dataloader: DataLoader,
     lr_scheduler: LRPolicyScheduler,
+    profiler: Optional[torch.profiler.profile] = None
 ) -> TrainValTestResults:
     """
     Train/validation/test loop.
@@ -476,8 +518,15 @@ def train_val_test(
     pipeline = TrainPipelineSparseDist(
         model, optimizer, device, execute_all_batches=True
     )
-
+    ####
+    current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
+    # writer = SummaryWriter('run/aa/experiment——_')
+    writer = SummaryWriter('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/dlrm/'+current_time)
+    # writer = SummaryWriter('runs/dlrm')
+    ####
+    
     for epoch in range(args.epochs):
+        
         _train(
             pipeline,
             train_dataloader,
@@ -488,13 +537,17 @@ def train_val_test(
             args.validation_freq_within_epoch,
             args.limit_train_batches,
             args.limit_val_batches,
+            writer,
+            profiler,
         )
+        if profiler is not None:
+            profiler.step()
         val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
         results.val_aurocs.append(val_auroc)
 
     test_auroc = _evaluate(args.limit_test_batches, pipeline, test_dataloader, "test")
     results.test_auroc = test_auroc
-
+    # writer.close()
     return results
 
 
@@ -706,18 +759,36 @@ def main(argv: List[str]) -> None:
         )
         val_dataloader = RestartableMap(multihot.convert_to_multi_hot, val_dataloader)
         test_dataloader = RestartableMap(multihot.convert_to_multi_hot, test_dataloader)
-    train_val_test(
-        args,
-        model,
-        optimizer,
-        device,
-        train_dataloader,
-        val_dataloader,
-        test_dataloader,
-        lr_scheduler,
+    
+    ###profiler
+    profiler_schedule = torch.profiler.schedule(wait=50, warmup=1, active=1, repeat=1)
+    currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
+    profiler_settings = dict(
+    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    schedule=profiler_schedule,
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/profiler/test'+currenttime),
+    record_shapes=True,
+    profile_memory=True,  
+    with_stack=True       
     )
-    if args.collect_multi_hot_freqs_stats:
-        multihot.save_freqs_stats()
+    ###profiler
+
+
+    with torch.profiler.profile(**profiler_settings) as profiler:
+        
+        train_val_test(
+            args,
+            model,
+            optimizer,
+            device,
+            train_dataloader,
+            val_dataloader,
+            test_dataloader,
+            lr_scheduler,
+            profiler,
+        )
+        if args.collect_multi_hot_freqs_stats:
+            multihot.save_freqs_stats()
 
 
 def invoke_main() -> None:
