@@ -41,6 +41,8 @@ from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
 from torch.profiler import profile, record_function, ProfilerActivity
+from torchviz import make_dot
+
 
 # OSS import
 try:
@@ -438,6 +440,9 @@ def _train(
         else limit_train_batches if limit_train_batches else len(train_dataloader)
     )
     skip = False
+
+    iteration = 0
+
     for batched_iterator in batched(iterator, n):
         
         if skip:
@@ -452,11 +457,15 @@ def _train(
                         if(writer is not None):
                             writer.add_scalar(f'Learning Rate/Group {i}', g['lr'], it)
 
-                loss, _ = pipeline.progress(batched_iterator)
+                loss, outputt = pipeline.progress(batched_iterator)
                 if(loss is None or np.isnan(loss)):
                     skip = True
                     break
-                
+                iteration += 1
+                if iteration == 70:
+                    output_path = f"/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/mutigpu_torchvis/forwordpass"
+                    graph = make_dot((loss, outputt,), params=dict(pipeline._model.named_parameters()))
+                    graph.render(output_path, format="png")
                 if(writer is not None):
                     writer.add_scalar('Training Loss', loss, it)
 
@@ -524,7 +533,7 @@ def train_val_test(
     writer = SummaryWriter('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/dlrm/'+current_time)
     # writer = SummaryWriter('runs/dlrm')
     ####
-    
+    writer.add_graph(model, train_dataloader)
     for epoch in range(args.epochs):
         
         _train(
@@ -540,8 +549,8 @@ def train_val_test(
             writer,
             profiler,
         )
-        if profiler is not None:
-            profiler.step()
+        # if profiler is not None:
+        #     profiler.step()
         val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
         results.val_aurocs.append(val_auroc)
 
@@ -773,7 +782,7 @@ def main(argv: List[str]) -> None:
     )
     ###profiler
 
-
+    
     with torch.profiler.profile(**profiler_settings) as profiler:
         
         train_val_test(
