@@ -35,6 +35,23 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.distributed.planner.types import (
+    Enumerator,
+    ParameterConstraints,
+    Partitioner,
+    PerfModel,
+    PlannerError,
+    PlannerErrorType,
+    Proposer,
+    ShardingOption,
+    Stats,
+    Storage,
+    StorageReservation,
+    Topology,
+)
+from typing import Dict
+
+from torchrec.distributed.types import ShardingType
 from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
@@ -42,8 +59,8 @@ from datetime import datetime
 
 from torch.profiler import profile, record_function, ProfilerActivity
 from torchviz import make_dot
-
-
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+import time
 # OSS import
 try:
     # pyre-ignore[21]
@@ -458,21 +475,27 @@ def _train(
                             writer.add_scalar(f'Learning Rate/Group {i}', g['lr'], it)
 
                 loss, outputt = pipeline.progress(batched_iterator)
+
+                
+                
+                if profiler is not None:###
+                    profiler.step()
+                iteration+=1
+
                 if(loss is None or np.isnan(loss)):
                     skip = True
                     break
-                iteration += 1
-                if iteration == 70:
-                    output_path = f"/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/mutigpu_torchvis/forwordpass"
-                    graph = make_dot((loss, outputt,), params=dict(pipeline._model.named_parameters()))
-                    graph.render(output_path, format="png")
+                # iteration += 1
+                # if iteration == 70:
+                #     output_path = f"/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/mutigpu_torchvis/forwordpass"
+                #     graph = make_dot((loss, outputt,), params=dict(pipeline._model.named_parameters()))
+                #     graph.render(output_path, format="png")
                 if(writer is not None):
                     writer.add_scalar('Training Loss', loss, it)
 
                 lr_scheduler.step()
 
-                if profiler is not None:
-                    profiler.step()
+                
                 
                 if is_rank_zero:
                     pbar.update(1)
@@ -531,9 +554,8 @@ def train_val_test(
     current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
     # writer = SummaryWriter('run/aa/experiment——_')
     writer = SummaryWriter('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/dlrm/'+current_time)
-    # writer = SummaryWriter('runs/dlrm')
-    ####
-    writer.add_graph(model, train_dataloader)
+    
+
     for epoch in range(args.epochs):
         
         _train(
@@ -551,11 +573,11 @@ def train_val_test(
         )
         # if profiler is not None:
         #     profiler.step()
-        val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
-        results.val_aurocs.append(val_auroc)
+        # val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
+        # results.val_aurocs.append(val_auroc)
 
-    test_auroc = _evaluate(args.limit_test_batches, pipeline, test_dataloader, "test")
-    results.test_auroc = test_auroc
+    # test_auroc = _evaluate(args.limit_test_batches, pipeline, test_dataloader, "test")
+    # results.test_auroc = test_auroc
     # writer.close()
     return results
 
@@ -711,20 +733,70 @@ def main(argv: List[str]) -> None:
         train_model.model.sparse_arch.parameters(),
         optimizer_kwargs,
     )
+    
+    table_cnt = 26
+    table_names = [f't_cat_{i}' for i in range(26)]
+
+    def gen_constraints(sharding_type: ShardingType = ShardingType.TABLE_WISE) -> Dict[str, ParameterConstraints]:
+        table_constraints = {
+            table_names[i]: ParameterConstraints(
+                sharding_types=[sharding_type.value],
+            ) for i in range(table_cnt)
+        }
+        return table_constraints
+    
+    #change sharding
+    # large_table_cnt = 2
+    # small_table_cnt = 2
+    # def gen_constraints(sharding_type: ShardingType) -> Dict[str, ParameterConstraints]:
+    #     large_table_constraints = {
+    #         "large_table_" + str(i): ParameterConstraints(
+    #             sharding_types=[sharding_type.value],
+    #         ) for i in range(large_table_cnt)
+    #     }
+    #     small_table_constraints = {
+    #         "small_table_" + str(i): ParameterConstraints(
+    #             sharding_types=[sharding_type.value],
+    #         ) for i in range(small_table_cnt)
+    #     }
+    #     constraints = {**large_table_constraints, **small_table_constraints}
+    #     return constraints
+    
+    sharding_type = ShardingType.DATA_PARALLEL  # Example: TABLE_WISE, ROW_WISE, etc.COLUMN_WISE DATA_PARALLEL
+    constraints = gen_constraints(sharding_type=sharding_type)
+    # from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+
+    # def get_row_wise_sharders() -> List[EmbeddingBagCollectionSharder]:
+    #     return [EmbeddingBagCollectionSharder(sharding_type=ShardingType.ROW_WISE)]
+
+    #change sharding
+    # print(constraints)
+
+
     planner = EmbeddingShardingPlanner(
         topology=Topology(
             local_world_size=get_local_size(),
             world_size=dist.get_world_size(),
             compute_device=device.type,
         ),
+        constraints=constraints,
         batch_size=args.batch_size,
         # If experience OOM, increase the percentage. see
         # https://pytorch.org/torchrec/torchrec.distributed.planner.html#torchrec.distributed.planner.storage_reservations.HeuristicalStorageReservation
         storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        # constraints=constraints,
     )
+    # sharder = get_default_sharders()
+    # sharder = [
+    #     ShardingType.ROW_WISE,
+    # ]
     plan = planner.collective_plan(
         train_model, get_default_sharders(), dist.GroupMember.WORLD
     )
+
+    # plan = planner.collective_plan(
+    #     train_model, sharders= sharder, dist.GroupMember.WORLD
+    # )
 
     model = DistributedModelParallel(
         module=train_model,
@@ -733,9 +805,9 @@ def main(argv: List[str]) -> None:
     )
     if rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
-            print(collectionkey)
+            print("collectionkey", collectionkey)
             for table_name, plan in plans.items():
-                print(table_name, "\n", plan, "\n")
+                print("table name", table_name, "\n", "plan",plan, "\n")
 
     def optimizer_with_params():
         if args.adagrad:
@@ -770,7 +842,7 @@ def main(argv: List[str]) -> None:
         test_dataloader = RestartableMap(multihot.convert_to_multi_hot, test_dataloader)
     
     ###profiler
-    profiler_schedule = torch.profiler.schedule(wait=50, warmup=1, active=1, repeat=1)
+    profiler_schedule = torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=10, skip_first=100)#, skip_first=100
     currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
     profiler_settings = dict(
     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -781,10 +853,11 @@ def main(argv: List[str]) -> None:
     with_stack=True       
     )
     ###profiler
+    
 
     
     with torch.profiler.profile(**profiler_settings) as profiler:
-        
+    # profiler = None
         train_val_test(
             args,
             model,
@@ -806,4 +879,15 @@ def invoke_main() -> None:
 
 
 if __name__ == "__main__":
+    start_time = time.time()
+    currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
+    # with open("runningtime/runningtime"+currenttime, "w") as f:
+    #             f.write(f"Running Time: {start_time:.5f} ms\n")
+
     invoke_main()  # pragma: no cover
+    end_time = time.time()
+    # currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
+    with open("runningtime/runningtime"+currenttime, "w") as f:
+                f.write(f"Running Time: {(end_time-start_time):.5f} ms\n")
+
+
