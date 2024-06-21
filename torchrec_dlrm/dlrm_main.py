@@ -8,6 +8,9 @@ import argparse
 import itertools
 import os
 import sys
+
+# from train_pipeline import TrainPipelineSparseDist
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterator, List, Optional
@@ -21,6 +24,7 @@ from torch.utils.data import DataLoader
 from torchrec import EmbeddingBagCollection
 from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
 from torchrec.distributed import TrainPipelineSparseDist
+
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
@@ -56,6 +60,7 @@ from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+from viztracer import VizTracer
 
 from torch.profiler import profile, record_function, ProfilerActivity
 from torchviz import make_dot
@@ -438,7 +443,6 @@ def _train(
     # if profiler is not None:
     #         print("profiling")
     pipeline._model.train()
-
     iterator = itertools.islice(iter(train_dataloader), limit_train_batches)
 
     is_rank_zero = dist.get_rank() == 0
@@ -464,10 +468,13 @@ def _train(
         
         if skip:
             skip = False
-
             continue
+        
         for it in itertools.count(start_it):
             try:
+                if(iteration == 100):
+                    tracer = VizTracer()
+                    tracer.start()
                 if is_rank_zero and print_lr:
                     for i, g in enumerate(pipeline._optimizer.param_groups):
                         print(f"lr: {it} {i} {g['lr']:.6f}")
@@ -480,7 +487,7 @@ def _train(
                 
                 if profiler is not None:###
                     profiler.step()
-                iteration+=1
+                
 
                 if(loss is None or np.isnan(loss)):
                     skip = True
@@ -499,7 +506,11 @@ def _train(
                 
                 if is_rank_zero:
                     pbar.update(1)
-            
+                if(iteration == 100):
+                    tracer.stop()
+                    tracer.save("/u/twei1/RecSystem/torchrec_dlrm/result.json")
+                iteration+=1
+
             except StopIteration:
                 if is_rank_zero:
                     print("Total number of iterations:", it)
@@ -553,11 +564,11 @@ def train_val_test(
     ####
     current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
     # writer = SummaryWriter('run/aa/experiment——_')
-    writer = SummaryWriter('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/dlrm/'+current_time)
+    writer = SummaryWriter('/u/twei1/RecSystem/runs/dlrm/'+current_time)
     
-
+    tracerit = 0
     for epoch in range(args.epochs):
-        
+
         _train(
             pipeline,
             train_dataloader,
@@ -571,6 +582,9 @@ def train_val_test(
             writer,
             profiler,
         )
+        
+
+
         # if profiler is not None:
         #     profiler.step()
         # val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
@@ -598,6 +612,7 @@ def main(argv: List[str]) -> None:
     Returns:
         None.
     """
+    
     args = parse_args(argv)
     for name, val in vars(args).items():
         try:
@@ -640,8 +655,9 @@ def main(argv: List[str]) -> None:
             "PARAMS: (lr, batch_size, warmup_steps, decay_start, decay_steps): "
             f"{(args.learning_rate, args.batch_size, args.lr_warmup_steps, args.lr_decay_start, args.lr_decay_steps)}"
         )
+        
     dist.init_process_group(backend=backend)
-
+    
     if args.num_embeddings_per_feature is not None:
         args.num_embeddings = None
 
@@ -687,6 +703,7 @@ def main(argv: List[str]) -> None:
             over_arch_layer_sizes=args.over_arch_layer_sizes,
             dense_device=device,
         )
+        
     elif args.interaction_type == InteractionType.DCN:
         dlrm_model = DLRM_DCN(
             embedding_bag_collection=EmbeddingBagCollection(
@@ -716,6 +733,7 @@ def main(argv: List[str]) -> None:
             "Unknown interaction option set. Should be original, dcn, or projection."
         )
 
+    
     train_model = DLRMTrain(dlrm_model)
     embedding_optimizer = torch.optim.Adagrad if args.adagrad else torch.optim.SGD
     # This will apply the Adagrad optimizer in the backward pass for the embeddings (sparse_arch). This means that
@@ -746,32 +764,11 @@ def main(argv: List[str]) -> None:
         return table_constraints
     
     #change sharding
-    # large_table_cnt = 2
-    # small_table_cnt = 2
-    # def gen_constraints(sharding_type: ShardingType) -> Dict[str, ParameterConstraints]:
-    #     large_table_constraints = {
-    #         "large_table_" + str(i): ParameterConstraints(
-    #             sharding_types=[sharding_type.value],
-    #         ) for i in range(large_table_cnt)
-    #     }
-    #     small_table_constraints = {
-    #         "small_table_" + str(i): ParameterConstraints(
-    #             sharding_types=[sharding_type.value],
-    #         ) for i in range(small_table_cnt)
-    #     }
-    #     constraints = {**large_table_constraints, **small_table_constraints}
-    #     return constraints
     
-    sharding_type = ShardingType.DATA_PARALLEL  # Example: TABLE_WISE, ROW_WISE, etc.COLUMN_WISE DATA_PARALLEL
+    sharding_type = ShardingType.DATA_PARALLEL  #  TABLE_WISE, ROW_WISE, COLUMN_WISE DATA_PARALLEL
     constraints = gen_constraints(sharding_type=sharding_type)
-    # from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-
-    # def get_row_wise_sharders() -> List[EmbeddingBagCollectionSharder]:
-    #     return [EmbeddingBagCollectionSharder(sharding_type=ShardingType.ROW_WISE)]
 
     #change sharding
-    # print(constraints)
-
 
     planner = EmbeddingShardingPlanner(
         topology=Topology(
@@ -795,14 +792,15 @@ def main(argv: List[str]) -> None:
     )
 
     # plan = planner.collective_plan(
-    #     train_model, sharders= sharder, dist.GroupMember.WORLD
+    #     train_model, sharders= sharder, dist.GroupMember.WORLD 
     # )
-
+    
     model = DistributedModelParallel(
         module=train_model,
         device=device,
         plan=plan,
     )
+    
     if rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
             print("collectionkey", collectionkey)
@@ -842,22 +840,21 @@ def main(argv: List[str]) -> None:
         test_dataloader = RestartableMap(multihot.convert_to_multi_hot, test_dataloader)
     
     ###profiler
-    profiler_schedule = torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=10, skip_first=100)#, skip_first=100
+    profiler_schedule = torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=10, skip_first=200)#, skip_first=100
     currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
     profiler_settings = dict(
     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
     schedule=profiler_schedule,
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('/u/twei1/Projects/DLRCs/RecSystem/torchrec_dlrm/runs/profiler/test'+currenttime),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('/u/twei1/RecSystem/runs/profiler/test'+currenttime),
     record_shapes=True,
     profile_memory=True,  
     with_stack=True       
     )
     ###profiler
     
-
-    
     with torch.profiler.profile(**profiler_settings) as profiler:
     # profiler = None
+        # torch.cuda.set_per_process_memory_fraction(0.5, 0)
         train_val_test(
             args,
             model,
@@ -874,7 +871,9 @@ def main(argv: List[str]) -> None:
 
 
 def invoke_main() -> None:
+    
     main(sys.argv[1:])
+    
 
 
 
@@ -887,7 +886,7 @@ if __name__ == "__main__":
     invoke_main()  # pragma: no cover
     end_time = time.time()
     # currenttime = datetime.now().strftime('%Y%m%d-%H%M%S')
-    with open("runningtime/runningtime"+currenttime, "w") as f:
+    with open("/u/twei1/RecSystem/runningtime/runningtime"+currenttime, "w") as f:
                 f.write(f"Running Time: {(end_time-start_time):.5f} ms\n")
 
 
