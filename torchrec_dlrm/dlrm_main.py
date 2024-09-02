@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterator, List, Optional
 
+from networkx import is_weighted
 import torch
 import torchmetrics as metrics
 import numpy as np
@@ -29,6 +30,7 @@ from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
     get_default_sharders,
+    get_unwrapped_module,
 )
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.storage_reservations import (
@@ -54,7 +56,6 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 from typing import Dict
-
 from torchrec.distributed.types import ShardingType
 from tqdm import tqdm
 
@@ -65,6 +66,7 @@ from viztracer import VizTracer
 from torch.profiler import profile, record_function, ProfilerActivity
 from torchviz import make_dot
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from sparse_allreduce_v1 import *
 import time
 # OSS import
 try:
@@ -561,6 +563,24 @@ def train_val_test(
     pipeline = TrainPipelineSparseDist(
         model, optimizer, device, execute_all_batches=True
     )
+
+    def save_model_parameters(model, filename="model_parameters.txt"):
+        with open(filename, "w") as f:
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    # print(f"Parameter name: {name}")
+                    # print(param.data)
+                    
+                    f.write(f"Parameter name: {name}\n")
+                    # f.write(f"{param.data}\n")
+                    
+                    # print(f"Parameter name: {name}")
+                    # print(param.data)
+                    
+                    # f.write(f"Parameter name: {name}\n")
+                    # f.write(f"{param.data}\n")
+
+    save_model_parameters(pipeline._model, "/u/twei1/RecSystem/torchrec_dlrm/model_parameters.txt")
     ####
     current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
     # writer = SummaryWriter('run/aa/experiment——_')
@@ -587,12 +607,12 @@ def train_val_test(
 
         # if profiler is not None:
         #     profiler.step()
-        # val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
-        # results.val_aurocs.append(val_auroc)
+        val_auroc = _evaluate(args.limit_val_batches, pipeline, val_dataloader, "val")
+        results.val_aurocs.append(val_auroc)
 
-    # test_auroc = _evaluate(args.limit_test_batches, pipeline, test_dataloader, "test")
-    # results.test_auroc = test_auroc
-    # writer.close()
+    test_auroc = _evaluate(args.limit_test_batches, pipeline, test_dataloader, "test")
+    results.test_auroc = test_auroc
+    writer.close()
     return results
 
 
@@ -645,6 +665,7 @@ def main(argv: List[str]) -> None:
     if torch.cuda.is_available():
         device: torch.device = torch.device(f"cuda:{rank}")
         backend = "nccl"
+        # backend = "gloo"
         torch.cuda.set_device(device)
     else:
         device: torch.device = torch.device("cpu")
@@ -696,12 +717,13 @@ def main(argv: List[str]) -> None:
     if args.interaction_type == InteractionType.ORIGINAL:
         dlrm_model = DLRM(
             embedding_bag_collection=EmbeddingBagCollection(
-                tables=eb_configs, device=torch.device("meta")
+                tables=eb_configs, device=torch.device("meta"),is_weighted = True,
             ),
             dense_in_features=len(DEFAULT_INT_NAMES),
             dense_arch_layer_sizes=args.dense_arch_layer_sizes,
             over_arch_layer_sizes=args.over_arch_layer_sizes,
             dense_device=device,
+
         )
         
     elif args.interaction_type == InteractionType.DCN:
@@ -765,7 +787,7 @@ def main(argv: List[str]) -> None:
     
     #change sharding
     
-    sharding_type = ShardingType.DATA_PARALLEL  #  TABLE_WISE, ROW_WISE, COLUMN_WISE DATA_PARALLEL
+    sharding_type = ShardingType.ROW_WISE  #  TABLE_WISE, ROW_WISE, COLUMN_WISE DATA_PARALLEL
     constraints = gen_constraints(sharding_type=sharding_type)
 
     #change sharding
@@ -794,12 +816,48 @@ def main(argv: List[str]) -> None:
     # plan = planner.collective_plan(
     #     train_model, sharders= sharder, dist.GroupMember.WORLD 
     # )
+
+    # def print_list_shape(lst):
+    #     if isinstance(lst, list):
+    #         shape = []
+    #         while isinstance(lst, list):
+    #             shape.append(len(lst))
+    #             if len(lst) > 0:
+    #                 lst = lst[0]
+    #             else:
+    #                 break
+    #         print("Shape of the list:", shape)
+    #     else:
+    #         print("The input is not a list.")
+
+
+    def my_custom_comm_hook(state, bucket: torch.distributed.GradBucket):
+        tensor = bucket.buffer()
+        ts = bucket.gradients()
+        tpar = bucket.parameters()
+        print("list Type", [a.shape for a in ts])
+
+        future = torch.futures.Future()
+        future.set_result(tensor)
+        return future
+    
+
+    def donothing_hook(state, bucket):
+        print("donothing")
+        tensor = bucket.buffer()
+        future = torch.futures.Future()
+        future.set_result(tensor)
+        return future
     
     model = DistributedModelParallel(
         module=train_model,
         device=device,
         plan=plan,
     )
+
+    # model._dmp_wrapped_module.register_comm_hook(None, my_custom_comm_hook)
+
+    
     
     if rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
@@ -809,9 +867,13 @@ def main(argv: List[str]) -> None:
 
     def optimizer_with_params():
         if args.adagrad:
-            return lambda params: torch.optim.Adagrad(
-                params, lr=args.learning_rate, eps=args.eps
-            )
+            # return lambda params: torch.optim.Adagrad(
+            #     params, lr=args.learning_rate, eps=args.eps
+            # )
+            return lambda params: torch.optim.SparseAdam(
+                    params, lr=args.learning_rate, eps=args.eps
+                )
+
         else:
             return lambda params: torch.optim.SGD(params, lr=args.learning_rate)
 
@@ -819,7 +881,9 @@ def main(argv: List[str]) -> None:
         dict(in_backward_optimizer_filter(model.named_parameters())),
         optimizer_with_params(),
     )
+
     optimizer = CombinedOptimizer([model.fused_optimizer, dense_optimizer])
+
     lr_scheduler = LRPolicyScheduler(
         optimizer, args.lr_warmup_steps, args.lr_decay_start, args.lr_decay_steps
     )
